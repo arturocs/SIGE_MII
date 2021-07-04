@@ -1,0 +1,268 @@
+---
+title: "Practica 1"
+author: "Arturo Cortés Sánchez"
+date: "1/4/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+library(knitr)
+library(tidyverse)
+library(funModeling)
+library(DataExplorer)
+library(caret)
+library(xgboost)
+library(pROC)
+library(rpart.plot)
+library(randomForest)
+
+```
+
+# Práctica 1
+
+## Índice
+
+* Introducción
+* Análisis exploratorio
+* Limpieza de datos
+* Árbol de decisión
+* xgboost
+* conclusiones
+
+
+## Introducción
+
+En esta práctica se analizarán datos del experimento ATLAS del CERN-LHC, que perseguía la
+identificación experimental de la partícula bosón de Higgs.
+El problema consiste en predecir si un registro de evento corresponde al decaimiento de un
+bosón de Higgs o se trata de ruido de fondo. Cada evento está caracterizado por un identificador,
+los valores de 30 variables y la etiqueta correspondiente (‘b’: ruido de fondo, ‘s’: bosón)
+
+
+## Descarga y lectura de datos
+
+```{r}
+if(!file.exists("data/training.csv")) {
+  library(httr)  
+  url <- "http://sl.ugr.es/higgs_sige"
+  GET(url, write_disk(temp <- tempfile(fileext = ".zip")))
+  unzip(temp, exdir = "data")
+  unlink(temp)
+}
+training_data_raw <- read_csv("data/training.csv")
+test_data_raw <- read_csv("data/test.csv")
+training_data_raw
+```
+
+## Analisis exploratorio
+
+Codificamos los valores perdidos como `NA`:
+
+
+```{r}
+training_data <- training_data_raw %>%  na_if(-999.0)
+```
+
+
+Resumen del conjunto de datos:
+```{r}
+summary(training_data)
+```
+
+
+Realizamos un histograma para ver la distibución de las clases:
+
+```{r}
+ggplot(training_data) +
+  geom_histogram(aes(x = Label, fill = as.factor(Label)), stat = "count") +
+  labs(x = "", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)"))
+```
+
+Vemos la pseudo-distribución de probabilidad de DER_met_phi_centrality. Lo ideal 
+sería utilizar shiny para visualizar fácilmente la de todas las variables, pero
+no he sido capaz de hacerlo funcionar correctamente:
+
+```{r densidad}
+ggplot(training_data) +
+  geom_density(aes(x = DER_met_phi_centrality, fill = Label, color = Label), alpha = 0.3) +
+  labs(x = "DER_met_phi_centrality", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)")) +
+  scale_color_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)"))
+```
+
+Vemos las variables mas correlacionadas con la columna objetivo:
+
+```{r}
+correlation_table(data_reduced %>%
+  mutate(Label = ifelse(Label == 's', 1, 0)), target='Label')
+```
+
+## Limpieza de datos
+
+Eliminamos las columnas con demasiados valores `NA`:
+
+```{r}
+status <- df_status(training_data)
+## columnas con NAs
+na_cols <- status %>%
+  filter(p_na > 70) %>%
+  select(variable)
+## columnas con valores diferentes
+dif_cols <- status %>%
+  filter(unique > 0.8 * nrow(training_data_raw)) %>%
+  select(variable)
+## eliminar columnas
+remove_cols <- bind_rows(
+  list(na_cols, dif_cols)
+)
+data_reduced <- training_data_raw %>%
+  select(-one_of(remove_cols$variable))
+
+data <-
+  data_reduced %>%
+  drop_na()
+data
+
+```
+
+## rpart
+
+
+Realizamos una particion de los datos
+
+```{r}
+trainIndex <- createDataPartition(data$Label, p = .75, list = FALSE)
+train <- data[ trainIndex, ] 
+val   <- data[-trainIndex, ]
+```
+
+
+
+```{r}
+rpartCtrl <- trainControl(
+  verboseIter = F, 
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary)
+
+rpartParametersGrid <- expand.grid(
+  .cp = c(0.001, 0.01, 0.1, 0.5))
+
+rpartModel1 <- train(
+  Label ~ ., 
+  data = train, 
+  method = "rpart", 
+  metric = "ROC", 
+  trControl = rpartCtrl, 
+  tuneGrid = rpartParametersGrid)
+```
+
+```{r}
+prediction     <- predict(rpartModel1, val, type = "raw")
+predictionProb <- predict(rpartModel1, val, type = "prob")
+
+auc1 <- roc(val$Label, predictionProb[["s"]], levels = unique(val[["Label"]]))
+```
+
+```{r}
+rpart.plot(rpartModel1$finalModel)
+```
+
+
+```{r}
+rpartModel1_roc <- plot.roc(auc1, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc1$auc[[1]], 2)))
+```
+
+### rpart con validación cruzada
+
+
+```{r}
+rpartCtrl2 <- trainControl(
+  verboseIter = F, 
+  classProbs = TRUE, 
+  method = "repeatedcv",
+  number = 10,
+  repeats = 1,
+  summaryFunction = twoClassSummary)
+
+rpartModel2 <- train(Label ~ ., 
+                     data = train, 
+                     method = "rpart", 
+                     metric = "ROC", 
+                     trControl = rpartCtrl2, 
+                     tuneGrid = rpartParametersGrid)
+```
+
+```{r}
+rpart.plot(rpartModel2$finalModel)
+```
+
+```{r}
+prediction     <- predict(rpartModel2, val, type = "raw")
+predictionProb <- predict(rpartModel2, val, type = "prob")
+
+auc2 <- roc(val$Label, predictionProb[["s"]], levels = unique(val[["Label"]]))
+```
+
+```{r}
+rpartModel2_roc <- plot.roc(auc2, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(auc2$auc[[1]], 2)))
+```
+
+
+## xgboost
+
+```{r}
+xgbCtrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 1,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+xgbGrid <- expand.grid(
+  nrounds = 200,
+  max_depth = c(6, 8, 10),
+  eta = c(0.001, 0.003, 0.01),
+  gamma = 1,
+  colsample_bytree = 0.5,
+  min_child_weight = 6,
+  subsample = 0.5
+)
+train
+```
+
+```{r}
+xgbModel <- train(
+  Label ~ ., 
+  data = train, 
+  method = "xgbTree", 
+  metric = "ROC", 
+  trControl = xgbCtrl,
+  tuneGrid = xgbGrid
+)
+print(xgbModel)
+```
+
+```{r}
+my_roc <- function(data, predictionProb, target_var, positive_class) {
+  auc <- roc(data[[target_var]], predictionProb[[positive_class]], levels = unique(data[[target_var]]))
+  roc <- plot.roc(auc, ylim=c(0,1), type = "S" , print.thres = T, main=paste('AUC:', round(auc$auc[[1]], 2)))
+  return(list("auc" = auc, "roc" = roc))
+}
+
+my_roc(val, predict(xgbModel, val, type = "prob"), "Label", "s")
+```
+
+```{r}
+imp <- xgb.importance(colnames(train), xgbModel$finalModel)
+xgb.plot.importance(imp)
+```
+
+
+## Conclusiones
+
+Todos los clasificadores automáticos, muestran resultados extremadamente similares,
+tanto que solo  puedo asumir que me he equivocado en algún lado. Probablemente 
+haya sido en el preprocesamiento de los datos, pero no soy capaz de identificar el fallo.

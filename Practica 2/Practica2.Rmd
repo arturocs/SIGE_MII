@@ -1,0 +1,854 @@
+---
+title: "Practica 2"
+output: html_document
+---
+
+
+#Práctica 2: Identificación de fake news en el conjuto Fakeddit
+**Por: Abel José Sanchez Alba y Arturo Cortés Sánchez**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(keras)
+library(caret)
+library(mice)
+library(rpart.plot)
+library(kerastuneR)
+library(tensorflow)
+library(reticulate)
+library(mlflow)
+```
+
+
+Previamente los datos deben de haber sido descargados y colocados en la carpeta `data`. Las imágenes en `data/images` y los comentarios en `data/comments`
+
+Comprobamos que los datos se han descargado correctamente
+```{r}
+img_sample <- image_load(path = './data/images/medium10000_twoClasses/test/1/1qlaa5.jpg', target_size = c(150, 150))
+img_sample_array <- array_reshape(image_to_array(img_sample), c(1, 150, 150, 3))
+plot(as.raster(img_sample_array[1,,,] / 255))
+```
+
+## Análisis exploratorio
+
+### Carga de datos
+Directorios:
+```{r}
+dataset_dir           <- './data/images/medium10000_twoClasses'
+train_images_dir      <- paste0(dataset_dir, '/train')
+val_images_dir        <- paste0(dataset_dir, '/val')
+test_images_dir       <- paste0(dataset_dir, '/test')
+comments_file          <- './data/comments/all_comments.tsv'
+```
+
+Metadatos:
+```{r}
+metadata_train <- read_tsv(paste0(train_images_dir, "/multimodal_train.tsv"))
+metadata_train <- metadata_train %>%
+  mutate(created_at = as.POSIXct(created_utc, origin="1970-01-01")) %>%
+  select(-one_of('created_utc')) %>%
+  mutate(class = ifelse(`2_way_label` == 0, 'Disinformation', 'Other'))
+```
+
+Comentarios (todos, sin `NA`):
+```{r}
+comments <- read_tsv(comments_file) %>%
+  drop_na()
+```
+
+### Combinar datos
+`left_join()` de la tabla de metadatos y de los comentarios
+```{r}
+metadata_train_comments <- left_join(x = metadata_train, y = comments, 
+                                     by = c("id" = "submission_id"),
+                                     keep = FALSE, suffix = c('.publication', '.comment'))
+metadata_train_comments
+```
+
+### Análisis exploratorio simple (2 clases)
+
+### Distribución de clases
+Seleccionar datos:
+```{r}
+data_binary <- metadata_train %>%
+  select(-one_of('3_way_label', '6_way_label', '2_way_label'))
+```
+
+Mostrar distribución de clases:
+```{r}
+table(data_binary$class)
+
+ggplot(data_binary) +
+  geom_histogram(aes(x = class, fill = class), stat = 'count')
+```
+Vemos cuantas noticias falsas tienen imagen con respecto a cuantas noticias verdaderas
+```{r}
+table(data_binary$class)
+
+ggplot(data_binary) +
+  geom_histogram(aes(x = hasImage, fill = class), stat = 'count')
+```
+Se puede apreciar que todas las noticias tienen imagen, por lo que el dato no es muy concluyente
+
+### Analizar clases por variable
+
+
+Se analiza como se distribuyen las clases para los comentarios, en concreto observamos su número
+
+```{r clases-var}
+ggplot(data_binary) +
+  geom_histogram(aes(x = num_comments, fill = as.factor(class)), bins = 10) +
+  labs(x = "num_comments", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("Desinformation", "other"))
+```
+
+Se considera una pseudo-distribución de probabilidad
+
+```{r densidad}
+ggplot(data_binary) +
+  geom_density(aes(x = num_comments, fill = class, color = class), alpha = 0.3) +
+  labs(x = "num_comments", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("Desinformation", "other")) +
+  scale_color_discrete(name ="Clase", labels=c("Desinformation", "other"))
+```
+
+En ambos casos se puede ver como las noticias falsas, en general, acumulan más número de comentarios
+
+Se analiza como se distribuyen las clases para las puntuaciones
+
+```{r clases-var}
+ggplot(data_binary) +
+  geom_histogram(aes(x = score, fill = as.factor(class)), bins = 10) +
+  labs(x = "score", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("Desinformation", "other"))
+```
+Se considera una pseudo-distribución de probabilidad
+
+```{r densidad}
+ggplot(data_binary) +
+  geom_density(aes(x = num_comments, fill = class, color = class), alpha = 0.3) +
+  labs(x = "num_comments", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("Desinformation", "other")) +
+  scale_color_discrete(name ="Clase", labels=c("Desinformation", "other"))
+```
+De nuevo se puede aprecias que las noticias falsas tienden a tener mucha mayor puntuación que las verdaderas, es decir, las noticias falsas tienden a tener más comentarios y más puntuación, lo que traduce en términos generales en más representación e impacto.
+
+### Evolución
+Evolución temporal (frecuencia acumulada):
+```{r}
+library(scales)
+ggplot(metadata_train, aes(x = created_at)) +
+  geom_histogram(aes(fill = class))
+```
+
+### Autores
+Autores que propagan desinformación:
+```{r}
+plotdata <- data_binary %>%
+  filter(class == "Disinformation") %>%
+  count(author) %>%
+  slice_max(n = 15, order_by = n, with_ties = FALSE)
+  
+ggplot(plotdata) +
+  geom_bar(aes(x = author, y = n), stat = 'identity') +
+  coord_flip()
+```
+
+### Títulos
+Extracción de características:
+```{r}
+data_binary_extended <- data_binary %>%
+  mutate(title_text_exclamations = str_count(title, "!")) %>%
+  mutate(title_text_caps = str_count(title, "[A-Z]")) %>%
+  mutate(title_text_digits = str_count(title, "[0-9]")) %>%
+  mutate(title_text_emojis = str_count(title, '[\U{1F300}-\U{1F6FF}]')) %>%
+  mutate(title_text_emoji_flag = str_count(title, '\U{1F1FA}|\U{1F1F8}]'))
+```
+
+Visualización:
+```{r}
+ggplot(data_binary_extended) + 
+  geom_density(aes(x=title_text_caps, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+### Comentarios
+Extracción de características:
+```{r}
+data_binary_comments <- metadata_train_comments %>%
+  select(-one_of('3_way_label', '6_way_label', '2_way_label'))
+
+data_binary_comments_extended <- data_binary_comments %>%
+  mutate(body_text_exclamations = str_count(body, "!")) %>%
+  mutate(body_text_caps = str_count(body, "[A-Z]")) %>%
+  mutate(body_text_digits = str_count(body, "[0-9]")) %>%
+  mutate(body_text_emojis = str_count(body, '[\U{1F300}-\U{1F6FF}]')) %>%
+  mutate(body_text_emoji_flag = str_count(body, '\U{1F1FA}|\U{1F1F8}]'))
+```
+
+Visualización:
+```{r}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_caps, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+
+## Analisis de metadatos y comentarios
+
+
+Cargamos los metadatos y los comentarios. Realizamos una union para saber a que noticia pertenece cada comentario.
+
+```{r}
+metadata_train <- read_tsv("./data/images/medium10000_twoClasses/train/multimodal_train.tsv")
+metadata_train <- metadata_train %>%
+  mutate(created_at = as.POSIXct(created_utc, origin="1970-01-01")) %>%
+  select(-one_of('created_utc')) %>%
+  mutate(class = ifelse(`2_way_label` == 0, 'Disinformation', 'Other'))
+
+comments <- read_tsv(comments_file) %>%
+  drop_na()
+
+metadata_train_comments <- left_join(x = metadata_train, y = comments, 
+                                     by = c("id" = "submission_id"),
+                                     keep = FALSE, suffix = c('.publication', '.comment'))
+
+
+
+metadata_val <- read_tsv("./data/images/medium10000_twoClasses/val/multimodal_validate.tsv")
+metadata_val <- metadata_val %>%
+  mutate(created_at = as.POSIXct(created_utc, origin="1970-01-01")) %>%
+  select(-one_of('created_utc')) %>%
+  mutate(class = ifelse(`2_way_label` == 0, 'Disinformation', 'Other'))
+
+
+metadata_val_comments <- left_join(x = metadata_val, y = comments, 
+                                     by = c("id" = "submission_id"),
+                                     keep = FALSE, suffix = c('.publication', '.comment'))
+
+
+```
+
+
+
+### Tokenizar
+
+Tokenizamos el campo sobre el que vamos a realizar la predicción, en este caso el título.
+
+```{r}
+texts_train  <- metadata_train_comments$title
+labels_train <- metadata_train_comments$"2_way_label"
+maxlen <- 50       # Se consideran las primeras 256 palabras de cada texto
+max_words <- 10000 # Maximo de palabras que se consideraran
+
+tokenizer <- text_tokenizer(num_words = max_words) %>%
+  fit_text_tokenizer(texts_train)
+
+sequences <- texts_to_sequences(tokenizer, texts_train)
+
+word_index = tokenizer$word_index
+cat("Se encontraron", length(word_index), "tokens unicos.\n")
+
+text_train_data <- pad_sequences(sequences, maxlen = maxlen)
+
+cat("Dimensiones de datos:", dim(text_train_data), "\n")
+cat("Número de ejemplos:", length(labels_train), "\n")
+
+
+texts_val  <- metadata_val_comments$title 
+labels_val <- metadata_val_comments$"2_way_label"
+
+
+tokenizer <- text_tokenizer(num_words = max_words) %>%
+  fit_text_tokenizer(texts_val)
+
+sequences <- texts_to_sequences(tokenizer, texts_val)
+
+word_index = tokenizer$word_index
+cat("Se encontraron", length(word_index), "tokens unicos.\n")
+
+text_val_data <- pad_sequences(sequences, maxlen = maxlen)
+
+cat("Dimensiones de datos:", dim(text_val_data), "\n")
+cat("Número de ejemplos:", length(labels_val), "\n")
+
+
+x_train <- text_train_data
+y_train <- labels_train
+x_val   <- text_val_data
+y_val   <- labels_val
+
+
+```
+Cargamos los embeddings Glove para mejorar los resultados de la red neuronal
+
+```{r}
+lines <- readLines('glove/glove.6B.100d.txt')
+embeddings_index <- new.env(hash = TRUE, parent = emptyenv())
+for (i in 1:length(lines)) {
+  line <- lines[[i]]
+  values <- strsplit(line, " ")[[1]]
+  word <- values[[1]]
+  embeddings_index[[word]] <- as.double(values[-1])
+}
+cat("Se encontraron", length(embeddings_index), "palabras con representación de vector.\n")
+
+embedding_dim <- 100
+embedding_matrix <- array(0, c(max_words, embedding_dim))
+for (word in names(word_index)) {
+  index <- word_index[[word]]
+  if (index < max_words) {
+    embedding_vector <- embeddings_index[[word]]
+    if (!is.null(embedding_vector))
+      embedding_matrix[index+1,] <- embedding_vector
+  } 
+}
+```
+### Crear y entrenar modelo
+
+Creamos un modelo compuesto de una embedding layer, una lstm layer para procesar secuencias de datos y dos dense layers de 32 neuronas y 1 neurona respectivamente. Posteriormente cargamos los embeddings en la embedding layer y congelamos sus pesos para que no varien durante el entrenamiento.
+
+
+```{r}
+model <- keras_model_sequential() %>%
+  layer_embedding(input_dim = max_words, output_dim = embedding_dim, input_length = maxlen) %>%
+  layer_lstm(units = 32) %>%
+  layer_dense(units=32, activation = "softmax") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+get_layer(model, index = 1) %>%
+  set_weights(list(embedding_matrix)) %>%
+  freeze_weights()
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  callbacks = list(
+    callback_early_stopping(
+    monitor = "val_loss",
+    min_delta = 0.001,
+    patience = 2,
+    verbose = 0,
+    mode = "min"
+  )),
+  x_train, y_train,
+  epochs = 10,
+  batch_size = 32,
+  validation_data = list(x_val, y_val)
+)
+
+evaluation  <- model %>% evaluate(x_val, y_val)
+
+```
+
+
+### Crear y entrenar modelo con kerastuner
+
+Utilizamos keras tuner para encontrar los parámetros para encontrar unos buenos parametros parámetros para optimizador y asi obtener mejores resultados
+
+```{r}
+build_model <- function(hp) {
+  model <- keras_model_sequential() %>%
+    layer_embedding(input_dim = max_words, output_dim = embedding_dim, input_length = maxlen) %>%
+    layer_lstm(units = 32) %>%
+    layer_dense(units=32, activation = "softmax") %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  get_layer(model, index = 1) %>%
+    set_weights(list(embedding_matrix)) %>%
+    freeze_weights()
+  
+  model %>% compile(
+    loss = 'binary_crossentropy',
+    optimizer = tf$keras$optimizers$RMSprop(
+        hp$Choice('learning_rate', values=c(1e-2, 1e-3, 1e-4))),
+    metrics = c('accuracy')
+  )
+}
+
+tuner <- Hyperband(
+  build_model,
+  objective = 'val_accuracy',
+  max_epochs = 3,
+  directory = 'hyper_band_tuner',
+  project_name = 'my_tuner'
+)
+
+x_train <- np_array(x_train)
+y_train<- np_array(y_train)
+x_val<- np_array(x_val)
+y_val<- np_array(y_val)
+
+model_tuned <- tuner %>% fit_tuner( callbacks = list(
+    callback_early_stopping(
+    monitor = "val_loss",
+    min_delta = 0.001,
+    patience = 2,
+    verbose = 0,
+    mode = "min",
+  )),
+  x_train, y_train,
+  epochs = 5,
+  batch_size = 32,
+  validation_data = list(x_val, y_val))
+
+plot_tuner(tuner)
+
+```
+
+
+Borramos los objetos mas grandes para liberar RAM
+```{r}
+rm(comments, data_binary, data_binary_comments, data_binary_comments_extended, data_binary_extended, metadata_train, metadata_train_comments, metadata_val, metadata_val_comments, text_train_data, text_val_data, embedding_matrix, word_index, x_train, y_train, x_val, y_val, lines, texts_train)
+```
+
+
+## Análisis de imágenes
+
+
+### Carga de datos
+
+Comenzamos conectando con los datos y creando los generadores y flujos necesarios para el entrenamiento y evaluación los modelos expuestos más adelante
+
+Directorios:
+```{r}
+dataset_dir           <- './data/images/medium10000_twoClasses/'
+train_images_dir      <- paste0(dataset_dir, 'train')
+val_images_dir        <- paste0(dataset_dir, 'val')
+test_images_dir       <- paste0(dataset_dir, 'test')
+```
+
+Generadores:
+```{r}
+train_images_generator <- image_data_generator(rescale = 1/255)
+val_images_generator   <- image_data_generator(rescale = 1/255)
+test_images_generator  <- image_data_generator(rescale = 1/255)
+```
+
+Flujos:
+```{r}
+train_generator_flow <- flow_images_from_directory(
+  directory = train_images_dir,
+  generator = train_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+
+validation_generator_flow <- flow_images_from_directory(
+  directory = val_images_dir,
+  generator = val_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+
+test_generator_flow <- flow_images_from_directory(
+  directory = test_images_dir,
+  generator = test_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+```
+
+### Creación del modelo inicial
+
+El primer paso para la predicción es comenzar con un modelo. En este caso se ha seleccionado un modelo con capas convolucionales de 32, 64, 128 y 256 filtros para ayudar al aprendizaje de la red. Posteriormente se crean capas densas de 512, 50 y 2 neuronas. Las dos neuronas de salida proporcionarán la clasificación en dos clases, fake new o no. Se ha seleccionado para todas las capas excepto la capa de salida la función de activación relu, pues el resto de funciones de activación no proporcionan un gradiente apto para el aprendizaje. Las funciones de activación acotadas como tanh o sigmoide hacen que el gradiente tienda a 0, el cual puede ser beneficioso en otros casos, pero no en este, ya que la red neuronal tiende a estabilizarse muy rápido y no aporta conclusiones relevantes.
+
+Se ha selecionado la función de pérdida de binary crossentropy, pues es la más adecuada para problemas de clasificación binaria donde los valores de salida son 0 y 1 como en este caso. 
+Definición de arquitectura:
+```{r}
+model <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = 50, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adam(
+  lr = 0.0001,
+  beta_1 = 0.9,
+  beta_2 = 0.999,
+  epsilon = NULL,
+  decay = 0,
+  amsgrad = FALSE,
+  clipnorm = NULL,
+  clipvalue = NULL
+  ),
+  metrics = c('accuracy'))
+```
+
+
+### Entrenamiento y validación
+En cuanto al entrenamiento, se ha empleado la validación con 2 "batches" y el entrenamiento por vía de 10 epochs.
+
+```{r}
+history <- model %>% 
+  fit_generator(
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    validation_steps = 1,
+    epochs = 10
+  )
+
+#plot(history)
+```
+
+### Test
+Las métricas seleccionadas para medir la bondad del modelo son la pérdida y la precisión del mismo. Así como estudiar su matriz de confusión más adelante.
+Métricas:
+```{r}
+metrics <- model %>% 
+  evaluate_generator(test_generator_flow, steps = 1)
+  
+message("  loss: ", metrics[1])
+message("  accuracy: ", metrics[2])
+```
+
+
+Visualizar matriz de confusión:
+```{r}
+predictions <- predict_generator(model, test_generator_flow, steps = 10)
+
+y_true <- test_generator_flow$classes
+y_pred <- ifelse(predictions[,1] > 0.7, 1, 0)
+
+cm <- confusionMatrix(as.factor(y_true), as.factor(y_pred))
+cm_prop <- prop.table(cm$table)
+
+cm_tibble <- as_tibble(cm$table)
+ggplot(data = cm_tibble) + 
+  geom_tile(aes(x=Reference, y=Prediction, fill=n), colour = "white") +
+  geom_text(aes(x=Reference, y=Prediction, label=n), colour = "white") +
+  scale_fill_continuous(trans = 'reverse')
+```
+
+
+
+
+
+### Creación del modelo con early stopping
+
+La primera técnica para mejorar el aprendizaje de la red es el early stopping. Esta técnica permite evitar el overfitting de la red mediante la parada cuando se detectan señales de que la red "memoriza" el conjunto de datos y deja de generalizar. Para comprobar la eficacia del método se mantiene la arquitectura de la red intacta.
+Definición de arquitectura:
+```{r}
+model <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = 50, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adam(
+  lr = 0.0001,
+  beta_1 = 0.9,
+  beta_2 = 0.999,
+  epsilon = NULL,
+  decay = 0,
+  amsgrad = FALSE,
+  clipnorm = NULL,
+  clipvalue = NULL
+  ),
+  metrics = c('accuracy'))
+```
+
+
+### Entrenamiento y validación
+En este momento, se indica el método de early stopping, que monitorizará el parámetro "val_loss" y que, si deja de disminuir un 0.001 durante dos epochs, abortará la ejecución para prevenir overfitting
+```{r}
+history <- model %>% 
+  fit_generator(
+   callbacks = list(
+    callback_early_stopping(
+    monitor = "val_loss",
+    min_delta = 0.001,
+    patience = 2,
+    verbose = 0,
+    mode = "min",
+  )),
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    validation_steps = 1,
+    epochs = 10
+  )
+
+```
+
+### Test
+De nuevo se comprueba con las mismas métricas y matriz de confusión
+Métricas:
+```{r}
+metrics <- model %>% 
+  evaluate_generator(test_generator_flow, steps = 1)
+  
+message("  loss: ", metrics[1])
+message("  accuracy: ", metrics[2])
+```
+
+
+Visualizar matriz de confusión:
+```{r}
+predictions <- predict_generator(model, test_generator_flow, steps = 10)
+
+y_true <- test_generator_flow$classes
+y_pred <- ifelse(predictions[,1] > 0.57, 1, 0)
+
+cm <- confusionMatrix(as.factor(y_true), as.factor(y_pred))
+cm_prop <- prop.table(cm$table)
+
+cm_tibble <- as_tibble(cm$table)
+ggplot(data = cm_tibble) + 
+  geom_tile(aes(x=Reference, y=Prediction, fill=n), colour = "white") +
+  geom_text(aes(x=Reference, y=Prediction, label=n), colour = "white") +
+  scale_fill_continuous(trans = 'reverse')
+```
+
+
+
+
+
+### Creación del modelo con early stopping, batch normalization, kernel_regularizer
+Como siguiente medida de mejora del aprendizaje se implementa el batch normalization y el kernel regularizer. Esto hace que las las capas de la red neuronal se estabilicen y además se añada una penalización en la función de coste que la red neuronal debe corregir en el entrenamiento con la intención de mejorar la predicción.
+Definición de arquitectura:
+```{r}
+model <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu", kernel_regularizer = regularizer_l1(0.01)) %>%
+  #layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 50, activation = "relu", kernel_regularizer = regularizer_l1(0.01)) %>%
+  layer_dense(units = 2, activation = "softmax", kernel_regularizer = regularizer_l1(0.01))
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer_adam(
+  lr = 0.0001,
+  beta_1 = 0.9,
+  beta_2 = 0.999,
+  epsilon = NULL,
+  decay = 0,
+  amsgrad = FALSE,
+  clipnorm = NULL,
+  clipvalue = NULL
+  ),
+  metrics = c('accuracy'))
+```
+
+
+### Entrenamiento y validación
+
+```{r}
+history <- model %>% 
+  fit_generator(
+   callbacks = list(
+    callback_early_stopping(
+    monitor = "val_loss",
+    min_delta = 0.001,
+    patience = 2,
+    verbose = 0,
+    mode = "min",
+  )),
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    validation_steps = 1,
+    epochs = 10
+  )
+
+
+```
+
+### Test
+Métricas:
+```{r}
+metrics <- model %>% 
+  evaluate_generator(test_generator_flow, steps = 1)
+  
+message("  loss: ", metrics[1])
+message("  accuracy: ", metrics[2])
+```
+
+
+Visualizar matriz de confusión:
+```{r}
+
+predictions <- predict_generator(model, test_generator_flow, steps = 10)
+predictions[,1]
+y_true <- test_generator_flow$classes
+y_pred <- ifelse(predictions[,1] > 0.576, 1, 0)
+
+cm <- confusionMatrix(as.factor(y_true), as.factor(y_pred))
+cm_prop <- prop.table(cm$table)
+
+cm_tibble <- as_tibble(cm$table)
+ggplot(data = cm_tibble) + 
+  geom_tile(aes(x=Reference, y=Prediction, fill=n), colour = "white") +
+  geom_text(aes(x=Reference, y=Prediction, label=n), colour = "white") +
+  scale_fill_continuous(trans = 'reverse')
+```
+
+
+###Ensemble 
+En el método ensemble se consideran tres redes neuronales; una versión reducida de la red neuronal convolucional, una versión de la red neuronal convolucional con función de activación sigmoide y una versión con la que se ha trabajado anteriormente. Se pretende así estabilizar la predicción y a su vez aprovechar la varianza observada con los modelos anteriores.
+```{r}
+
+model1 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = 50, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+
+
+model2 <-keras_model_sequential() %>%
+  layer_conv_2d(filters = 20, kernel_size = c(5, 5), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 100, activation = "sigmoid", kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = 2, activation = "softmax")
+
+model3 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% 
+  layer_batch_normalization(epsilon = 0.01) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu", kernel_regularizer = regularizer_l1(0.01)) %>%
+  layer_dense(units = 50, activation = "relu", kernel_regularizer = regularizer_l1(0.01)) %>%
+  layer_dense(units = 2, activation = "softmax", kernel_regularizer = regularizer_l1(0.01))
+
+
+model_input  <- layer_input(shape= c(64, 64, 3))
+
+model_list   <- c(model1(model_input) %>% layer_flatten(), 
+                  model2(model_input) %>% layer_flatten(),
+                  model3(model_input) %>% layer_flatten())
+
+model_output <- layer_concatenate(model_list) %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+
+model <- keras_model(
+  inputs  = model_input, 
+  outputs = model_output
+)
+
+model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_adam(),
+  metrics = c('accuracy'))
+
+history <- model %>% 
+  fit_generator(
+   callbacks = list(
+    callback_early_stopping(
+    monitor = "val_loss",
+    min_delta = 0.001,
+    patience = 2,
+    verbose = 0,
+    mode = "min",
+  )),
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    validation_steps = 2,
+    epochs = 10
+  )
+plot(history)
+
+model %>% evaluate_generator(test_generator_flow, steps = 50)
+
+
+```
+
+Test
+
+```{r}
+predictions <- predict_generator(model, test_generator_flow, steps = 10)
+
+y_true <- test_generator_flow$classes
+y_pred <- ifelse(predictions[,1] > 0.655, 1, 0)
+
+predictions[,1] 
+
+cm <- confusionMatrix(as.factor(y_true), as.factor(y_pred))
+cm_prop <- prop.table(cm$table)
+plot(cm$table)
+
+
+cm_tibble <- as_tibble(cm$table)
+ggplot(data = cm_tibble) + 
+  geom_tile(aes(x=Reference, y=Prediction, fill=n), colour = "white") +
+  geom_text(aes(x=Reference, y=Prediction, label=n), colour = "white") +
+  scale_fill_continuous(trans = 'reverse')
+
+```
+
+
+### MLflow
+Ya que mlflow no puede usarse para ejecutar archivos Rmd, se ha optado por usar 
+mlflow para monitorizar un script de R que contiene la primera red neuronal de este archivo
+
+```{r}
+
+mlflow_run(entry_point = "script_mlflow.R")
+
+
+# Visualizar en interfaz MLflow
+# http://127.0.0.1:5987/
+mlflow_ui()
+
+
+# Cambiar valores de los parámetros
+mlflow_run(entry_point = "script_mlflow.R", parameters = c(dropout = 0.5, epochs = 3))
+```
+
